@@ -1,0 +1,362 @@
+---
+title: "Analiza porównawcza ryzyka w modelach klasy GARCH dla portfela wybranych aktywów"
+author: "Piotr Lemancewicz"
+date: "28 07 2019 & aktualizacje 23 11 2023 "
+output:
+  pdf_document: default
+  html_document: default
+  word_document: default
+---
+W tym dokumencie przeprowadzę krótką analizę z wykorzystaniem niektórych zagadnień z ekonometrii finansowej i języka programowania R.
+Rozkłady danych zostaną zaprezentowane przez różne wykresy i scharakteryzowane specyficznymi statystkami, a także zostaną oszacowane różne modele GARCH, służące do modelowania warunkowej wariancji. Wyliczone zostaną także wartości zagrożone (VaR) i oczekiwana strata (ES). VaR może być zdefiniowany jako maksymalny poziom straty dla (1-p)% obserwacji, natomiast ES jako oczekiwana strata wśród q% najgorszych scenariuszy. Stworzone modele zostaną porównane między sobą pod względem dopasowania i predykcji rzeczywistych wydarzeń w przeszłości.
+
+Dane dotyczą cen zamknięcia akcji Activision Blizzard Inc i GLUU MOBILE INC, które pobrane zostały ze strony stooq.com. Zbudowano z nich portfel z wagami (0.5,0.5). Następnie obliczono logarytmiczne stopy zwrotu portfela, które zazwyczaj charakteryzują się stacjonarnością.
+
+```{r, message = FALSE}
+#Load packages
+library(zoo)
+library(moments)
+library(forecast)
+library(tseries)
+library(knitr)
+library(FinTS)
+library(rugarch)
+library(urca)
+library(xts)
+library(quantmod)
+```
+
+```{r}
+#Prepare data
+filename1 <-"https://stooq.pl/q/d/l/?s=atvi.us&d1=20110103&d2=20190703&i=d"
+filename2 <-"F:/_datasets/GLUU.csv" #AKTUALIZACJA 2023: dane GLUU zostaną załadowane z pliku archiwalnego.
+x1 <- read.csv(filename1)
+x2 <- read.csv(filename2, sep = "", dec = ",", header = TRUE)
+y1 <- zoo(x1$Zamkniecie, as.Date(x1$Data))
+y2 <- zoo(x2$Zamkniecie, as.Date(x2$Data))
+y <- cbind(y1,y2)
+names(y) <- c("ATVI","GLUU")
+dates<-index(y) 
+startDate <- as.Date("2011-01-03")
+endDate   <- as.Date("2019-07-03")
+y         <- window(y, start=startDate, end=endDate)
+w   <- c(0.5,0.5) # porfolio weights
+dy  <- 100*diff(log(y)) # log returns of stocks
+r   <- zoo(dy%*%w,index(dy)) # portfolio returns
+R   <- as.numeric(coredata(r))
+P   <- exp(cumsum(r/100)) # the value of investment in the portfolio
+```
+
+```{r , echo = FALSE} 
+plot(r, main="Dzienne logarytmiczne zwroty z portfela",xlab="Data",ylab="Stopa zwrotu"); abline(h=0)
+```
+
+W kolejnym kroku obliczono podstawowe statystyki rozkładu zwrotów. Kurtoza wynosząca 7.131 sugeruje dużą koncentrację wokół średniej. Na poziomie istotności 1% odrzucono hipotezę zerową z testu Jarque-Bera zakładającą, że rozkład stóp zwrotu portfela akcji jest normalny.
+
+``` {r}
+Nyear <- 365/as.numeric(mean(diff(dates)))
+mu    <- mean(r)*Nyear
+sig   <- sd(r)*sqrt(Nyear) 
+mom <- as.data.frame(c(Nyear,mu,sig,min(r),max(r), skewness(r), kurtosis(r),jarque.bera.test(R)$stat))
+rownames(mom) <- c("N","mu","sig","min","max","skew","kurt", "JB test"); colnames(mom)="value"
+kable(mom, digits=3)
+```
+
+W celu sprawdzenia czy na przykład rozkład t-studenta dobrze opisuje rozkład zwrótów stworzone zostały dodatkowe graficzne porównania (wykres funkcji gęstości i wykres kwanty-kwantyl). 
+
+``` {r}
+# Density plot
+Rstar <- (R-mean(R))/sd(R)
+d     <- density(Rstar) # returns the density data 
+xlim = c(min(Rstar),max(Rstar)); ylim = c(-0.02,max(d$y)+0.1)
+# xlim = c(min(Rstar),-2); ylim = c(-0.01,0.05)
+par(mfrow=c(1,1), cex = 0.75, bty="l")
+plot(d, main="Funkcja gęstości", ylab = "Gęstość", xlim = xlim, ylim = ylim, lwd=2,xlab="") 
+xfit <-seq(min(Rstar),max(Rstar),length=100);
+# normal distribution
+yfit <-dnorm(xfit,0,1); lines(xfit, yfit, lwd=1, col="red") 
+# t-Student distribution
+v = 4 + 6/(kurtosis(R)-3)
+yfit <-ddist("std",y=xfit,shape=v);   lines(xfit, yfit, lwd=1, col="blue") 
+legend(-4,0.5,c("Empiryczny","Normalny","t-Student"), col=c("black","red","blue"),bty="n",lty=c(1,1,1))
+```
+
+Na wykresie kwantylowym można zaobserwować, że prawdopodobieństwa wystąpienia obserwacji znacznie oddalonych od średniej wartości (tzw. nietypowych) są znacznie wyższe niż dla rozkładu normalnego. Przeskalowany rozkład t-studenta lepiej opisuje rozkład stóp zwrotów portfela.
+
+``` {r}
+q            <- seq(0.001, 0.999, 0.001)
+QteoNORM         <- qnorm(q)        # normal distribution
+QteoT  <- qdist("std",p=q,shape=v) # scaled t-student dist
+Qemp         <- quantile(Rstar,q)         # data 
+
+lim0    <- c(-5,5)                           # range on plot
+par(mfrow=c(1,2), cex = 0.7, bty="l")
+plot(Qemp,QteoNORM, main="QQplot", col="red", xlim = lim0, ylim = lim0,
+     xlab="empiryczny kwantyl", ylab="teoretyczny kwantyl normalny");abline(a=0,b=1, lwd=1) 
+plot(Qemp,QteoT, main="QQplot", col="red", xlim = lim0, ylim = lim0,
+     xlab="empiryczny kwantyl", ylab="teoretyczny skalowany kwantyl t-student");abline(a=0,b=1, lwd=1) 
+```
+
+Poniższe wykresy przedstawiają wartości funkcji ACF/PACF odpowiednio dla stóp zwrotu, ich wartości bezwzględnych i kwadratów stóp zwrotu. Nie występuje wysoka autokorelacja dla stóp zwrotu, ale dla wartości bezwzględnych i kwadratów już tak. Świadczy to o możliwości występowania zjawiska grupowania wariancji. 
+
+Przeprowadzony został test Box-Ljung, którego hipoteza zerowa wskazuje na brak znaczącej autokorelacji dla stóp zwrotu. W przypadku stóp zwrotu brak znaczącej autokorelacji został potwierdzony, ale w przypadku wartości bezwględnych i kwadratów stóp zwrotu odrzucono hipotezę zerową o braku autokorelacji na 1% poziomie istotności.
+
+``` {r}
+Acf(R, main="ACF of daily returns" )
+pacf(R, main="PACF of daily returns" )
+Acf(abs(R), main="ACF of daily absolute returns" )
+Acf(R^2, main="ACF of squared daily returns" )
+Box.test(R, lag = 20, type = c("Ljung-Box"))
+Box.test(R^2, lag = 20, type = c("Ljung-Box"))
+```
+
+W sytuacji, gdy w modelu występuje zjawisko grupowania wariancji, tzw. efektów ARCH (następujące po sobie okresy o nasilonej lub względnie stabilnej zmienności), to wariancja składnika losowego dla różnych obserwacji jest ze sobą powiązana, co prowadzi do błędów w estymacji. 
+Wynik testu na występowanie efektów ARCH wśród zwrotów sugeruje odrzucenie hipotezy zerowej o braku występowania efektów ARCH na poziomie 5% istotności.
+
+``` {r}
+ArchTest(R)
+```
+
+Potwierdzona została także stacjonarność szeregu czasowego poprzez test KPSS i ADF.
+
+``` {r} 
+summary(ur.kpss(R, type = "mu"))
+summary(ur.kpss(R, type = "tau"))
+summary(ur.df(R, type="none", selectlags="BIC"))
+```
+
+Następnie wybrano opóźnienia modelu dla średniej (ARIMA) na podstawie kryterium BIC, zakładając rozkład t-studenta. Najniższą wartość kryterium miał model ARIMA (1,0) i ten zostanie użyty.
+
+``` {r}
+AC <- autoarfima(R, ar.max=3, ma.max=3, criterion='BIC', method='partial', arfima=FALSE, include.mean=NULL, distribution.model='std')
+
+kable(head(AC$rank.matrix))
+```
+
+Najlepszy model GARCH(p,q) został wybrany na podstawie najniższej wartości kryteriów informacyjnych. Dla logarytmicznych stóp zwrotu opisywanych rozkładem normalnym najlepszym modelem okazał się GARCH (1,1), a  dla opisywanych rozkładem t-studenta również GARCH (1,1).
+
+``` {r}
+LagSelG <- function(x, Pmax=4, Qmax=4, crit="SIC", dist="norm"){
+  IC <- matrix(NA, Pmax, Qmax+1)
+  for(p in 1:Pmax){
+    for(q in 0:Qmax){
+      
+      spec = ugarchspec(variance.model=list(model="sGARCH", garchOrder=c(p,q)), 
+                        mean.model=list(armaOrder=c(1,0), include.mean=TRUE),  
+                        distribution.model=dist)
+      fit  = ugarchfit(data=x, spec=spec)
+      if(crit == "AIC"){IC[p,q+1] <- infocriteria(fit)[1] }
+      if(crit == "SIC"){IC[p,q+1] <- infocriteria(fit)[2] }
+      if(crit == "HQ"){	IC[p,q+1] <- infocriteria(fit)[4] }
+    }
+  }
+  rownames(IC) <- paste('p=',1:Pmax, sep="")
+  colnames(IC) <- paste('q=',0:Qmax, sep="")
+  return(IC)
+}
+LagSelG(r,4,4,crit="SIC", dist="norm") #(1,1)
+LagSelG(r,4,4,crit="SIC", dist="std") #(1,1)
+```
+
+Kolejnym krokiem było dopasowanie modeli do danych. Poniżej wydruki dopasowania modelu GARCH (1,1) z rozkładem normalnym i GARCH-t (1,1) z rozkładem t-studenta.
+
+``` {r}
+spec0 = ugarchspec(variance.model=list(model="sGARCH", garchOrder=c(1,1)), 
+                   mean.model=list(armaOrder=c(1,0), include.mean=TRUE),  
+                   distribution.model="norm")
+fit0 = ugarchfit(data=r, spec=spec0, solver = "hybrid")
+
+spec1 = ugarchspec(variance.model=list(model="sGARCH", garchOrder=c(1,1)), 
+                   mean.model=list(armaOrder=c(1,0), include.mean=TRUE),  
+                   distribution.model="std")
+fit1 = ugarchfit(data=r, spec=spec1, solver="hybrid")
+fit1
+```
+
+Nie wszystkie parametry w modelu ARMA(1,0)-GARCH(1,1) są istotne. Biorąc pod uwagę odrzucenie hipotezy zerowej w teście Adjusted Pearson Goodness-of-Fit, model nie jest dobrze dopasowany do danych.
+
+``` {r}
+spec1 = ugarchspec(variance.model=list(model="sGARCH", garchOrder=c(1,1)), 
+                   mean.model=list(armaOrder=c(1,0), include.mean=TRUE),  
+                   distribution.model="std")
+fit1 = ugarchfit(data=r, spec=spec1, solver="hybrid")
+fit1
+```
+
+W modelu GARCH-t(1,1) suma parametrów alfa i beta jest mniejsza od 1, co wskazuje na stacjonarność wariancji i powracanie do średniej wartości. Wszystkie parametry GARCH są dodatnie i istotne statystycznie. Wyniki testu Weighted Ljung-Box na standaryzowanych kwadratach reszt sugerują, aby nie odrzucać hipotezy zerowej o braku autokorelacji.
+Natomiast wartości p-value testu mnożników Lagrange’a na występowanie efektów ARCH wśród wystandaryzowanych reszt świadczą o tym, że nie można odrzucić hipotezy o niewystępowaniu efektów ARCH.
+Model GARCH-t(1,1) spełnia wytyczne dobrze dopasowanego modelu.
+
+Poniższy wykres sugeruje występowanie efektu dźwigni w szeregu zwrotów, czyli asymetrycznego wpływu informacji na poziom przyszłej wariancji. Dlatego dalej w analizie rozważone zostaną także asymetryczne modele GARCH z rozkładem t-studenta.
+
+``` {r , echo = FALSE}
+plot(fit1, which=7)
+```
+
+``` {r}
+spec.e   = ugarchspec(variance.model=list(model="eGARCH", garchOrder=c(1,1)), 
+                      mean.model=list(armaOrder=c(1,0), include.mean=TRUE),  
+                      distribution.model="std")
+spec.gjr = ugarchspec(variance.model=list(model="gjrGARCH", garchOrder=c(1,1)), 
+                      mean.model=list(armaOrder=c(1,0), include.mean=TRUE),  
+                      distribution.model="std")
+
+fit.e   = ugarchfit(data=r, spec=spec.e,solver="hybrid")  
+fit.gjr = ugarchfit(data=r, spec=spec.gjr,solver="hybrid")
+IC <- cbind(infocriteria(fit1), infocriteria(fit.e), infocriteria(fit.gjr))
+colnames(IC) <- c("GARCH", "eGARCH", "gjrGARCH")
+IC
+```
+
+Najniższa wartość kryteriów informacyjnych jest dla modelu eGARCH.
+
+```{r}
+fit.e
+```
+
+Wszystkie parametry oprócz "mu" są statystycznie istotne. Nie występuje autokorelacja reszt ani efekty ARCH dla wariancji.
+Na podstawie uzyskanych oszacowań można wnioskować, że występuje efekt asymetrycznego wpływu informacji, gdyż alfa jest istotna i przyjmuje wartość ujemną, więc wskazuje to na większy wpływ szoków ujemnych. Parametr gamma również jest istotny.
+
+
+W celu zbadania czy większa warunkowa zmienność powoduje większy zwrot, czyli czy występuje tzw. “premia za ryzyko” oszacowano model GARCH-in-mean. Współczynnik archm nie jest statystycznie istotny (na poziomie 5%), więc nie występuje znaczna premia za ryzyko. Na podstawie krytieriów informacyjnych model eGARCH wydaje się być nadal najlepszy.
+
+``` {r}
+spec.m = ugarchspec(variance.model=list(model="eGARCH", garchOrder=c(1,1)), 
+                    mean.model=list(armaOrder=c(1,0), include.mean=TRUE, archm = TRUE), distribution.model="std")
+fit.m  = ugarchfit(data=r, spec=spec.m, solver = "hybrid")
+
+IC <- cbind(infocriteria(fit1), infocriteria(fit.e), infocriteria(fit.gjr), infocriteria(fit.m))
+colnames(IC) <- c("GARCH", "eGARCH", "gjrGARCH","GARCH-in-mean")
+IC
+```
+
+Poniżej sporządzono także różne wykresy kolejno dla modeli GARCH, eGARCH, eGARCH-in-mean
+
+Wykres zwrotów z warunkowym odchyleniem standardowym
+
+``` {r , echo = FALSE,message = FALSE} 
+plot(fit1, which=1) #Series with 2 Conditional SD Superimposed
+plot(fit.e, which=1)
+plot(fit.m, which=1)
+```
+
+Zwroty z 1% limitem VaR
+
+``` {r , echo = FALSE,message = FALSE} 
+plot(fit1, which=2) #Series with 1% VaR Limits
+plot(fit.e, which=2)
+plot(fit.m, which=2)
+```
+
+Empiryczna gęstość wystandaryzowanych reszt
+
+``` {r , echo = FALSE,message = FALSE} 
+plot(fit1, which=8) #Empirical Density of Standarized Residuals
+plot(fit.e, which=8)
+plot(fit.m, which=8)
+```
+
+ACF wystandaryzowanych reszt
+
+``` {r , echo = FALSE,message = FALSE} 
+plot(fit1, which=10) #ACF of Standarized Residuals
+plot(fit.e, which=10)
+plot(fit.m, which=10)
+```
+
+ACF wystandaryzowanych kwadratów reszt
+
+``` {r , echo = FALSE,message = FALSE} 
+plot(fit1, which=11) #ACF of Squared Standarized Residuals
+plot(fit.e, which=11)
+plot(fit.m, which=11)
+```
+
+Krzywa wpływu informacji
+
+``` {r , echo = FALSE,message = FALSE} 
+plot(fit1, which=12) #News Impact Curve
+plot(fit.e, which=12)
+plot(fit.m, which=12)
+```
+
+Następnie dokonano estymacji modeli z zastosowaniem funkcji ugarchroll w celu analizy VaR w okresie out-of-sample. Okres out-of-sample ustalono na 500 obserwacji. Pozostałe 1637 obserwacji będzie stanowiło okres in-sample. Została wybrana opcja reksursywnego okna i ponownej esytmacji co 25 obserwacji, co oznacza że pierwsza prognoza (dla 25 obserwacji) będzie obliczana na podstawie modelu estymowanego z 1637 obserwacji, kolejna na bazie modelu estymowanego z 1637+25, kolejna na bazie modelu z obserwacji 1637+25+25,itd. Wygenerowane zostały raporty które pozwolą na tzw. backtesting modeli, m.in. sprawdzenie poprawnej ilości przekroczeń VaR
+
+``` {r}
+roll1 = ugarchroll(spec1 , data = r, forecast.length = 500, n.ahead = 1, refit.every = 25, refit.window = 'recursive', calculate.VaR = TRUE, solver = 'hybrid', VaR.alpha = c(0.01,0.05))
+rolle = ugarchroll(spec.e, data = r, forecast.length = 500, n.ahead = 1, refit.every = 25, refit.window = 'recursive', calculate.VaR = TRUE, solver = 'hybrid', VaR.alpha = c(0.01,0.05))
+rollm = ugarchroll(spec.m, data = r, forecast.length = 500, n.ahead = 1, refit.every = 25, refit.window = 'recursive', calculate.VaR = TRUE, solver = 'hybrid', VaR.alpha = c(0.01,0.05))
+# Generate the 1% VaR report
+report(roll1, VaR.alpha = 0.01)
+report(rolle, VaR.alpha = 0.01)
+report(rollm, VaR.alpha = 0.01)
+```
+
+Najmniej przekroczeń oszacowanej wartości narażonej na ryzyko przy poziomie istotności 1% uzyskał standardowy model GARCH. W żadnym z modeli nie odrzucono hipotezy zerowej zakładającej poprawną ilość przekroczeń i niezależność.
+
+``` {r}
+# Generate the 5% VaR report
+report(roll1, VaR.alpha = 0.05)
+report(rolle, VaR.alpha = 0.05)
+report(rollm, VaR.alpha = 0.05)
+```
+
+Najmniej przekroczeń oszacowanej wartości narażonej na ryzyko przy poziomie istotności 5% uzyskał również standardowy model GARCH. W żadnym z modeli nie odrzucono hipotezy zerowej zakładającej poprawną ilość przekroczeń i niezależność, co jest istotnym powodem do uznania wszystkie modele za poprawnie skonstruowane.
+
+Poniżej przedstawiono wykresy, które obrazują kiedy wartość VaR została przekroczona w tzw. rolling prognozach kolejno dla modeli GARCH, eGARCH, GARCH-in-mean na poziomie istotności 1%.
+
+``` {r}
+D = as.POSIXct(rownames(roll1@forecast$VaR))
+VaRplot(0.01, actual = xts(roll1@forecast$VaR[, 3], D), VaR = xts(roll1@forecast$VaR[,1], D, xlab = "Data"))
+VaRplot(0.01, actual = xts(rolle@forecast$VaR[, 3], D), VaR = xts(rolle@forecast$VaR[,1], D, xlab = "Data"))
+VaRplot(0.01, actual = xts(rollm@forecast$VaR[, 3], D), VaR = xts(rollm@forecast$VaR[,1], D, xlab = "Data"))
+```
+
+Tutaj wykresy przekroczenia VaR dla poziomu 5%.
+
+``` {r}
+VaRplot(0.05, actual = xts(roll1@forecast$VaR[, 3], D), VaR = xts(roll1@forecast$VaR[,2], D, xlab = "Data"))
+VaRplot(0.05, actual = xts(rolle@forecast$VaR[, 3], D), VaR = xts(rolle@forecast$VaR[,2], D, xlab = "Data"))
+VaRplot(0.05, actual = xts(rollm@forecast$VaR[, 3], D), VaR = xts(rollm@forecast$VaR[,2], D, xlab = "Data"))
+```
+
+Poniżej stworzono także wykres ze zrealizowanymi zwrotami, VaR (Value at Risk) i ES (Expected Shortfall) wyliczonych na podstawie modelu GARCH (1,1).
+``` {r}
+df1_var <- as.data.frame(roll1@forecast, which = "density") 
+
+f = function(x, skew, shape) qdist("std", p = x, mu = 0, sigma = 1, skew = skew, shape = shape) 
+
+test_es = df1_var['density.Mu'] + df1_var['density.Sigma']*apply(df1_var, 1, function(x) 
+  integrate(f,0,0.01, skew = x['density.Skew'], shape = x['density.Shape'])$value/0.01) 
+
+test_es <- as.zoo(as.xts(test_es)) 
+test_es <- aggregate(test_es, function(tt) as.Date(tt, tz = "")) #convert to date 
+
+test_es5 = df1_var['density.Mu'] + df1_var['density.Sigma']*apply(df1_var, 1, function(x) 
+  integrate(f,0,0.05, skew = x['density.Skew'], shape = x['density.Shape'])$value/0.05) 
+
+test_es5 <- as.zoo(as.xts(test_es5)) 
+test_es5 <- aggregate(test_es5, function(tt) as.Date(tt, tz = ""))
+
+dates1 <- seq(from = as.Date("2017-07-10"), to = as.Date("2019-07-03"), by = 60)
+par(mfrow=c(1,1), cex = 0.7, bty="l")
+plot(as.zoo(roll1@forecast$VaR[1]),type = "l", pch = 16, ylim=c(min(test_es):max(roll1@forecast$VaR[3])),col='blue',ylab="Value",xlab="Time",xaxt = "n")
+axis.Date(side=1, at = dates1, format="%m-%Y")
+lines(as.zoo(test_es),col='red')
+legend(x="topright",y=0.95,legend=c("VaR","ES","Realized"),col=c("blue", "red","black"), lty=1, cex=0.8)
+lines(as.zoo(roll1@forecast$VaR[3]),col="black")
+```
+
+Na koniec przeprowadzony został McNeil and Frey test na poprawnie skalibrowaną oczekiwaną stratę (ES). Nie odrzucono hipotezy zerowej o poprawnej kalibracji zarówno na poziomie istotności 1% i 5%, co sugeruje poprawnie skalibrowany oczekiwany spadek.
+
+```{r}
+# McNeila and Frey test for well calibrated Expected Shortfall
+temp1 <- ESTest(alpha = 0.01, roll1@forecast$VaR[, 3], test_es, roll1@forecast$VaR[,1])
+temp1$p.value
+temp5 <- ESTest(alpha = 0.05, roll1@forecast$VaR[, 3], test_es5, roll1@forecast$VaR[,2])
+temp5$p.value
+```
+
+Podsumowanie:
+
+Do modeli GARCH dopasowano ARMA(1,0). Pod względem kryteriów informacyjnych najlepszy okazał się model eGARCH (1,1), jednakże model GARCH (1,1) uzyskał najmnieszą ilość przekroczeń oszacowanych wartości VaR. W obu modelach zastosowany został rozkład t-studenta ze względu na leptokurtyczność rozkładu zwrotów. Nie udało się jednoznacznie potwierdzić przewagi któregoś z nich w opisywaniu zmienności zwrotów wybranego portfela. 
